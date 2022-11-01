@@ -7,7 +7,7 @@ use std::time::Duration;
 use std::io;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
-use notify::{Event, EventHandler, EventKind, recommended_watcher, RecursiveMode, Watcher};
+use notify::{Event, EventHandler, EventKind, recommended_watcher, RecommendedWatcher, RecursiveMode, Watcher};
 use notify::event::{CreateKind, DataChange, MetadataKind, ModifyKind, RemoveKind, RenameMode};
 
 struct AppendFile {
@@ -43,7 +43,7 @@ struct FilesysStreamProgram {
 }
 
 
-fn visit_dirs(dir: &Path, cb: &dyn FnMut(&DirEntry)) -> io::Result<()> {
+fn visit_dirs(dir: &Path, cb: &mut dyn FnMut(&DirEntry)) -> io::Result<()> {
 
     if dir.is_dir() {
         for entry in fs::read_dir(dir)? {
@@ -68,11 +68,13 @@ impl FilesysStreamProgram {
 
         let mut entries = HashMap::new();
 
-        visit_dirs(&src, & |dirent| {
+        visit_dirs(&src, &mut |dirent| {
             let rel_path = dirent.path().strip_prefix(&src).unwrap().to_path_buf();
-            let dest_path_abs = dest.join(rel_path);
+            let dest_path_abs = dest.join(&rel_path);
             if dirent.path().is_dir(){
-                create_dir(dest_path_abs).unwrap();
+                if !dest_path_abs.exists() {
+                    create_dir(dest_path_abs).unwrap();
+                }
             } else {
                 let size = dirent.metadata().unwrap().len() as usize;
                 entries.insert(rel_path.clone(), AppendFile::new(&dest_path_abs, size));
@@ -83,29 +85,41 @@ impl FilesysStreamProgram {
     }
 
     fn update_file_contents(&mut self, rel_path: &Path) {
-        let src_path = self.src.join(path);
-        let src_len = src_path.metadata().unwrap().len() as usize;
-        let mut entry = self.entries.get_mut(rel_path).unwrap();
-        if src_len <= entry.len {
-            entry.len = src_len;
-        } else {
-            let num_tail_bytes = src_len - entry.len;
-            let mut src_file = File::open(src_path).unwrap();
-            src_file.seek(SeekFrom::Start(entry.len as u64)).unwrap();
-            let mut buffer = vec![0u8; num_tail_bytes];
-            src_file.read(&mut buffer).unwrap();
-            entry.write(&buffer).unwrap();
+        let src_path = self.src.join(&rel_path);
+        if src_path.exists() {
+            let src_len = src_path.metadata().unwrap().len() as usize;
+            let mut entry = match self.entries.get_mut(rel_path) {
+                Some(e) => e,
+                None => {
+                    self.create_file(rel_path);
+                    self.entries.get_mut(&rel_path.to_path_buf()).unwrap()
+                }
+            };
+
+            if src_len <= entry.len {
+                entry.len = src_len;
+            } else {
+                let num_tail_bytes = src_len - entry.len;
+                let mut src_file = File::open(src_path).unwrap();
+                src_file.seek(SeekFrom::Start(entry.len as u64)).unwrap();
+                let mut buffer = vec![0u8; num_tail_bytes];
+                src_file.read(&mut buffer).unwrap();
+                entry.write(&buffer).unwrap();
+            }
         }
+
     }
 
     fn create_file(&mut self, rel_path: &Path) {
         self.entries.insert(rel_path.to_path_buf(), AppendFile::new(&self.dest.join(rel_path), 0));
-        self.update_file_contents(rel_path);
     }
 
     fn remove_file(&mut self, rel_path: &Path){
         self.entries.remove(rel_path).unwrap();
-        fs::remove_file(self.dest.join(rel_path)).unwrap();
+        let dest_path = self.dest.join(rel_path);
+        if dest_path.exists() {
+            fs::remove_file(self.dest.join(rel_path)).unwrap();
+        }
     }
 
     fn handle_create(&mut self, path: &Path, kind: CreateKind) {
@@ -113,7 +127,11 @@ impl FilesysStreamProgram {
             CreateKind::File => {
                self.create_file(path);
             }
-            CreateKind::Folder => {create_dir(self.dest.join(path)).unwrap()}
+            CreateKind::Folder => {
+                let dest_path = self.dest.join(path);
+                if !dest_path.exists(){
+                    create_dir(self.dest.join(path)).unwrap()}
+                }
             _ => {}
         }
         println!("Create {:?} {:?}", path, kind);
@@ -124,7 +142,20 @@ impl FilesysStreamProgram {
                 self.update_file_contents(&paths[0]);
             }
             ModifyKind::Name(nckind) => {
-                match nckind{
+                let real_nckind = match nckind {
+                    RenameMode::Any => {
+                        if paths.len() > 1 {
+                            RenameMode::Both
+                        } else if self.src.join(&paths[0]).exists() {
+                            RenameMode::To
+                        } else {
+                            RenameMode::From
+                        }
+                    },
+                    other => other
+                };
+
+                match real_nckind{
                     RenameMode::To => {
                         self.create_file(&paths[0]);
                     }
@@ -148,7 +179,11 @@ impl FilesysStreamProgram {
         let dest_path = self.dest.join(path);
         match kind {
             RemoveKind::File => {self.remove_file(path)}
-            RemoveKind::Folder => {remove_dir(dest_path).unwrap();}
+            RemoveKind::Folder => {
+                if dest_path.exists(){
+                    remove_dir(dest_path).unwrap();
+                }
+            }
             _ => {}
         }
         println!("Remove {:?} {:?}", path, kind);
@@ -181,6 +216,7 @@ fn main() {
     let event_handler = FilesysStreamProgram::new((&args[1]).parse().unwrap(), (&args[2]).parse().unwrap());
 
     let mut watcher = recommended_watcher(event_handler).unwrap();
+    println!("Using {:?} watcher", RecommendedWatcher::kind());
 
     watcher.watch((&args[1]).as_ref(), RecursiveMode::Recursive).unwrap();
 
